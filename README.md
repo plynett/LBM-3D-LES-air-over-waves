@@ -2,6 +2,9 @@
 
 This repository contains a single Python script implementing a 3D D3Q19 lattice Boltzmann method (LBM) with an LES closure and a free-surface / moving-bed geometry pipeline using per-link open fractions (`lattice_open_frac`) and binary open flags (`lattice_open`).
 
+## Demo video
+https://youtu.be/USMgdHAk_DQ
+
 ## What’s in the file
 Key components (naming follows the script):
 - **Equilibrium**: D3Q19 low-Mach isothermal `feq`
