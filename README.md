@@ -1,2 +1,21 @@
-# LBM-3D-LES-air-over-waves
-Taichi-based D3Q19 LBM with LES closure and free-surface/moving-bed link gating (lattice_open / lattice_open_frac), including pull-streaming, KBC/BGK-style collision, and post-stream boundary handling for fringe inlet, top Dirichlet, and moving-wall IBB.
+# LBM-3D-LES-air-over-waves (Taichi) — single-file solver
+
+This repository contains a single Python script implementing a 3D D3Q19 lattice Boltzmann method (LBM) with an LES closure and a free-surface / moving-bed geometry pipeline using per-link open fractions (`lattice_open_frac`) and binary open flags (`lattice_open`).
+
+## What’s in the file
+Key components (naming follows the script):
+- **Equilibrium**: D3Q19 low-Mach isothermal `feq`
+- **Geometry / interface**: `compute_phi_slope_corrected()`, `build_lattice_open_from_free_surface_periodic()`
+- **Initialization**: `init_fields()`
+- **Time loop**: `main()`
+- **Core LBM steps**: `macro_step()`, `compute_LES()` (optional), `collide_KBC()`, `stream()` (pull), `apply_open_boundary_conditions()`, `copy_post_and_swap()`
+
+## Requirements
+- Python 3.10+
+- `taichi`
+- `numpy`
+- (Optional for plotting/outputs) whatever the script imports (e.g., `matplotlib`)
+
+Install:
+```bash
+pip install taichi numpy
