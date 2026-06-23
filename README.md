@@ -1,87 +1,124 @@
-# LBM-3D-LES-air-over-waves (Taichi) — single-file solver
+# LBM-3D-LES-air-over-waves (Taichi)
 
-This repository contains a **single Python script** implementing a 3D **D3Q19 isothermal lattice Boltzmann method (LBM)** with an **LES closure** and a **free-surface / moving-bed boundary pipeline**. The intent is a practical, phase-resolved flow solver with robust near-interface behavior using **per-link “open fractions”** rather than binary wet/dry switching.
+This repository contains a Taichi-based 3D D3Q19 lattice Boltzmann solver for
+the original air-over-moving-waves problem and the current single-fluid water
+free-surface experiments.
 
-## Demo video
-https://youtu.be/USMgdHAk_DQ
+## Active Files
 
-## Core numerical model (at a glance)
+- `LBM_3D_LES_air_over_waves_v1.py`: original reference source.
+- `LBM_3D_LES_air_over_waves_CODEX.py`: active development solver.
+- `lbm_lattice.py`: shared D3Q19 lattice constants.
+- `lbm_env.py`: small environment-variable parsing helpers.
+- `run_ab_case.py`: diagnostic run harness that records frames and metrics.
+- `AGENTS.md`: project physics and boundary-condition rules.
+- `WATER_FREE_SURFACE_IMPLEMENTATION.md`: development log for the water and
+  free-surface path.
 
-### LBM formulation
-- **Lattice**: D3Q19
-- **Equilibrium**: standard low-Mach, second-order Hermite expansion  
-  `feq = w*rho*(1 + 3(c·u) + 4.5(c·u)^2 - 1.5|u|^2)`
-- **Streaming**: **pull scheme** (gather from upstream neighbors)
-- **Collision**: BGK/KBC-style relaxation (as implemented), with stability logic (e.g., limiters/positivity safeguards) where present in the script
-- **Macroscopic reconstruction**: `rho` and `u` from zeroth/first moments of `f`
+## Numerical Model
 
-### LES closure (optional)
-- Local eddy-viscosity / effective relaxation computed from a strain-rate measure (Smagorinsky-style approach, as implemented).
-- The LES step updates the effective relaxation parameter used during collision.
+- Lattice: D3Q19.
+- Equilibrium: standard low-Mach, second-order Hermite expansion.
+- Streaming: pull scheme.
+- Collision: selectable `regularized` or retained KBC-style collision path.
+- LES: optional Smagorinsky-style local eddy-viscosity update.
+- Solid geometry: per-link solid/open flags and open fractions from the moving
+  boundary representation.
+- Water free surface: height-function kinematic path, plus an experimental VOF
+  path under `LBM_FREE_SURFACE_TRACKING=vof`.
 
-## Free-surface / moving boundary handling
+## Current Free-Surface Pressure Setup
 
-### Height-function free surface
-- The free surface is represented by a **single-valued height field** `water_h(y,x) = η(x,y,t)` sampled at horizontal cell centers.
-- Periodicity is assumed in **x/y** for sampling and indexing; **z** is bounded.
+For water free-surface runs, the default pressure formulation is:
 
-### Per-link openness (cut-link gating)
-A key design feature is the construction of two per-link fields:
-- `lattice_open[k,j,i][q] ∈ {0,1}`: binary open/blocked link flag
-- `lattice_open_frac[k,j,i][q] ∈ [0,1]`: continuous “open fraction” used for smooth blending
+```powershell
+$env:LBM_PRESSURE_FORMULATION = "hydrostatic_balanced"
+```
 
-For each cell-center `(xc,yc,zc)` and each direction `q`, the code samples the surface at the **link half-step endpoint**:
-`(xq,yq,zq) = (xc,yc,zc) + 0.5*dx*(cx[q], cy[q], cz[q])`
+This stores the LBM density as the pressure perturbation about the flat
+still-water hydrostatic state, while the diagnostic plot reconstructs total
+gauge pressure for display. This is a physical hydrostatic decomposition, not a
+damping or smoothing model.
 
-Then:
-- `η(xq,yq)` is obtained via **periodic bilinear interpolation** of `water_h`
-- A vertical gap is formed: `gap = zq - η`
-- A smooth open fraction is computed and clamped:
-  `frac = clamp(0.5 + gap/dx, 0, 1)`
+The active free-surface boundary options are:
 
-This yields a **one-cell-thick transition** that reduces numerical noise compared to hard wet/dry toggles.
+```powershell
+$env:LBM_FREE_SURFACE_BOUNDARY = "cell"        # default
+$env:LBM_FREE_SURFACE_BOUNDARY = "hydrostatic"
+```
 
-### Streaming with open-fraction blending
-During streaming, partially blocked links are handled via blending:
-- open portion: streams from upstream population
-- blocked portion: falls back to an opposite-direction population (bounce-back-like)
+The old experimental `link`, `fsk_link`, and `fsl` modes are not active solver
+options.
 
-This provides a practical cut-link behavior driven by `lattice_open_frac`.
+## Minimal Install
 
-### Moving bed / moving-wall enforcement
-The script supports a prescribed moving boundary velocity through:
-- `u_wave`, `v_wave`, `w_wave` (defined on the horizontal grid)
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install taichi numpy matplotlib
+```
 
-Near boundary/interface cells (`near_obstacle==1`), a moving-wall IBB/bounce-back-style correction is applied and **blended by the open fraction** so the enforcement strengthens as links become more blocked.
+## Example Water Gaussian Run
 
-## Code organization (within the single file)
-Function names may vary slightly, but the solver follows this sequence:
+```powershell
+$env:LBM_PHYSICS_MODE = "water"
+$env:LBM_FREE_SURFACE_INITIAL = "gaussian"
+$env:LBM_GAUSSIAN_AMPLITUDE_M = "8"
+$env:LBM_X_BOUNDARY = "solid"
+$env:LBM_TI_ARCH = "gpu"
+$env:LBM_PRESSURE_DIAGNOSTIC = "total_pressure"
 
-- **Initialization**
-  - constants/scales
-  - wave bed kinematics + prescribed wall velocity
-  - interface geometry + per-link openness
-  - velocity field initialization (log-law + optional perturbations)
-  - `f` initialized to equilibrium
+.\.venv\Scripts\python.exe .\run_ab_case.py `
+  --module .\LBM_3D_LES_air_over_waves_CODEX.py `
+  --label water_gaussian_amp8 `
+  --steps 10000 `
+  --plot-freq 500 `
+  --plot-start 0 `
+  --output-dir .\test_runs\water_gaussian_amp8 `
+  --random-seed 12345
+```
 
-- **Per timestep**
-  1. Update bed geometry/velocity
-  2. Rebuild interface geometry and `lattice_open / lattice_open_frac`
-  3. Re-apply near-bed population constraints (blended)
-  4. Macro reconstruction (`rho,u`)
-  5. LES closure (optional)
-  6. Collision
-  7. Streaming (pull)
-  8. Post-stream boundary conditions (fringe inlet / top / bed IBB)
-  9. Commit `f_new -> f`
+Leave Matplotlib interactive windows enabled when visually assessing pressure
+and vorticity behavior.
 
-## Running
-### Requirements
-- Python 3.10+
-- `taichi`
-- `numpy`
-- Any optional plotting/IO libs imported by the script (e.g., `matplotlib`)
+## Example Disconnected VOF Run
 
-Install minimal:
-```bash
-pip install taichi numpy
+This starts from a flat pool by setting the Gaussian amplitude to zero, then
+adds a finite VOF water block above the free surface:
+
+```powershell
+$env:LBM_PHYSICS_MODE = "water"
+$env:LBM_FREE_SURFACE_TRACKING = "vof"
+$env:LBM_FREE_SURFACE_INITIAL = "gaussian"
+$env:LBM_GAUSSIAN_AMPLITUDE_M = "0"
+$env:LBM_PRESSURE_FORMULATION = "vof_component_balanced"
+$env:LBM_VOF_INITIAL_SHAPE = "block"
+$env:LBM_VOF_BLOCK_SIZE_M = "4"
+$env:LBM_VOF_BLOCK_BOTTOM_M = "12"
+$env:LBM_X_BOUNDARY = "solid"
+$env:LBM_VOF_THIN_GAP_BRIDGE = "1"          # optional unresolved one-cell coalescence bridge
+$env:LBM_VOF_THIN_GAP_BRIDGE_STRENGTH = "4" # conservative test value; very large values are diagnostic
+$env:LBM_VOF_COLLAPSE_TRAPPED_GAS = "1"     # optional unresolved trapped-air removal
+$env:LBM_VOF_COLLAPSE_INTERVAL = "200"
+$env:LBM_VOF_COLLAPSE_MAX_VOLUME_M3 = "8"
+$env:LBM_TI_ARCH = "gpu"
+
+.\.venv\Scripts\python.exe .\run_ab_case.py `
+  --module .\LBM_3D_LES_air_over_waves_CODEX.py `
+  --label vof_falling_block_amp0 `
+  --steps 1500 `
+  --plot-freq 250 `
+  --plot-start 0 `
+  --output-dir .\test_runs\vof_falling_block_amp0 `
+  --random-seed 12345
+```
+
+For detached VOF water, use `vof_component_balanced`. This balances the initial
+flat pool against the still-water hydrostatic reference while retaining ordinary
+gravity on detached water above the pool. The old full `total_pressure` setup is
+kept only as an explicit diagnostic via `LBM_ALLOW_TOTAL_PRESSURE_VOF_DIAGNOSTIC=1`.
+
+The optional trapped-gas collapse pass is a low-overhead unresolved-gas closure.
+It flood-fills exterior gas on the GPU, collapses only trapped gas below
+`LBM_VOF_COLLAPSE_MAX_VOLUME_M3`, and removes the same tracked water mass from
+exterior VOF interface cells. It is not a column-height collapse.
