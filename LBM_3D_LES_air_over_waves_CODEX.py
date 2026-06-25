@@ -1,4 +1,4 @@
-"""D3Q19 LBM solver for air-over-waves and single-fluid water tests.
+﻿"""D3Q19 LBM solver for air-over-waves and single-fluid water tests.
 
 The active solver supports two related configurations:
 
@@ -22,17 +22,20 @@ import os
 import taichi as ti
 import numpy as np
 
-from lbm_env import env_choice, env_int
+from lbm_env import env_choice, env_int, taichi_cache_config
 from lbm_lattice import D3Q19_CX, D3Q19_CY, D3Q19_CZ, D3Q19_OPP, D3Q19_WEIGHTS
 
 # -----------------------------------------------------------------------------
 # Taichi runtime initialization
 # - LBM_TI_ARCH=gpu selects the GPU backend (CUDA/Metal/Vulkan depending on platform).
 # - LBM_TI_ARCH=cpu is useful for compiler diagnostics when GPU codegen fails.
-# - If you need deterministic behavior for debugging, consider setting ti.init(..., random_seed=...).
+# - Taichi's offline JIT cache is kept in the project directory by default,
+#   avoiding stale locks in the global C:/taichi_cache location.
 # -----------------------------------------------------------------------------
 taichi_arch_name = env_choice("LBM_TI_ARCH", "gpu", ("gpu", "cpu"))
-ti.init(arch=ti.cpu if taichi_arch_name == "cpu" else ti.gpu)
+taichi_cache_kwargs = taichi_cache_config()
+ti.init(arch=ti.cpu if taichi_arch_name == "cpu" else ti.gpu, **taichi_cache_kwargs)
+print(f"Taichi offline cache: {taichi_cache_kwargs['offline_cache_file_path']}", flush=True)
 
 # -----------------------------------------------------------------------------
 # Configuration overview
@@ -100,6 +103,10 @@ initialize_free_surface_populations = os.environ.get(
     "LBM_INIT_FREE_SURFACE_POPULATIONS",
     "0",
 ).lower() in ("1", "true", "yes")
+vof_link_aperture_enabled = 1 if os.environ.get(
+    "LBM_VOF_LINK_APERTURE",
+    "1",
+).lower() in ("1", "true", "yes") else 0
 vof_empty_fill_threshold = float(os.environ.get("LBM_VOF_EMPTY_FILL_THRESHOLD", "0.0"))
 if not (0.0 <= vof_empty_fill_threshold < 0.5):
     raise ValueError("LBM_VOF_EMPTY_FILL_THRESHOLD must be in [0, 0.5)")
@@ -196,9 +203,10 @@ use_link_wall_velocity = 1 if wall_velocity_sampling == "link" else 0
 
 # parameters for the solid bed and, in water mode, the physical free surface
 bed_profile = os.environ.get("LBM_BED_PROFILE", "moving_sine" if physics_mode == "air" else "flat").lower()
-if bed_profile not in ("moving_sine", "flat"):
-    raise ValueError("LBM_BED_PROFILE must be 'moving_sine' or 'flat'")
+if bed_profile not in ("moving_sine", "flat", "piecewise_linear"):
+    raise ValueError("LBM_BED_PROFILE must be 'moving_sine', 'flat', or 'piecewise_linear'")
 bed_is_moving = 1 if bed_profile == "moving_sine" else 0
+bottom_file_path = os.environ.get("LBM_BOTTOM_FILE", "bottom.txt")
 
 bed_amp_m = 1.5 if bed_profile == "moving_sine" else 0.0 # amplitude [m] of the solid-bed sine wave
 bed_amp_m = float(os.environ.get("LBM_BED_AMP_M", bed_amp_m))
@@ -210,6 +218,76 @@ wave_period = bed_wavelength_m / max(wave_speed, 1e-12)  # period [s]
 offset_m = 2.0*bed_amp_m + 3.0*dx if bed_profile == "moving_sine" else 0.0
 offset_m = float(os.environ.get("LBM_BED_LEVEL_M", offset_m))  # solid bed elevation [m]
 U_wave_phys = wave_speed if bed_is_moving == 1 else 0.0 # max horizontal velocity of the solid moving bed [m/s]
+
+
+def load_piecewise_bottom_profile(path: str) -> tuple[np.ndarray, dict[str, float | int | str]]:
+    resolved_path = path
+    if not os.path.isabs(resolved_path):
+        resolved_path = os.path.abspath(resolved_path)
+    if not os.path.exists(resolved_path):
+        raise FileNotFoundError(f"LBM_BOTTOM_FILE not found: {resolved_path}")
+
+    pairs: list[tuple[float, float]] = []
+    with open(resolved_path, "r", encoding="utf-8") as bottom_file:
+        for line_number, raw_line in enumerate(bottom_file, start=1):
+            line = raw_line.split("#", 1)[0].replace(",", " ").strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 2:
+                raise ValueError(
+                    f"Invalid bottom profile line {line_number} in {resolved_path}: "
+                    "expected exactly two values: x_m z_m"
+                )
+            try:
+                x_val = float(parts[0])
+                z_val = float(parts[1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid numeric value on bottom profile line {line_number} in {resolved_path}"
+                ) from exc
+            if not (np.isfinite(x_val) and np.isfinite(z_val)):
+                raise ValueError(f"Non-finite bottom profile value on line {line_number} in {resolved_path}")
+            pairs.append((x_val, z_val))
+
+    if len(pairs) < 2:
+        raise ValueError(f"LBM_BOTTOM_FILE must contain at least two x z pairs: {resolved_path}")
+
+    pairs.sort(key=lambda item: item[0])
+    xs = np.array([pair[0] for pair in pairs], dtype=np.float64)
+    zs = np.array([pair[1] for pair in pairs], dtype=np.float64)
+    if np.any(np.diff(xs) <= 0.0):
+        raise ValueError(f"LBM_BOTTOM_FILE contains duplicate x coordinates: {resolved_path}")
+
+    x_centers = (np.arange(Nx, dtype=np.float64) + 0.5) * dx
+    z_centers = np.interp(x_centers, xs, zs, left=zs[0], right=zs[-1]).astype(np.float32)
+    z_at_lx = float(np.interp(Lx_m, xs, zs, left=zs[0], right=zs[-1]))
+
+    metadata: dict[str, float | int | str] = {
+        "path": resolved_path,
+        "point_count": len(pairs),
+        "first_x": float(xs[0]),
+        "last_x": float(xs[-1]),
+        "min_z": float(np.min(z_centers)),
+        "max_z": float(np.max(z_centers)),
+        "z_at_lx": z_at_lx,
+    }
+    return z_centers, metadata
+
+
+if bed_profile == "piecewise_linear":
+    piecewise_bed_z_np, piecewise_bed_metadata = load_piecewise_bottom_profile(bottom_file_path)
+else:
+    piecewise_bed_z_np = np.full(Nx, offset_m, dtype=np.float32)
+    piecewise_bed_metadata = {
+        "path": "",
+        "point_count": 0,
+        "first_x": 0.0,
+        "last_x": Lx_m,
+        "min_z": float(offset_m),
+        "max_z": float(offset_m),
+        "z_at_lx": float(offset_m),
+    }
 
 free_surface_depth_m = float(os.environ.get("LBM_FREE_SURFACE_DEPTH_M", depth_swl_m))
 free_surface_base_m = float(os.environ.get("LBM_FREE_SURFACE_LEVEL_M", offset_m + free_surface_depth_m))
@@ -334,7 +412,7 @@ FS_INTERFACE = 2
 # ==============================
 # LBM & Numerical Stability Parameters
 # ==============================
-# LBM reference/stability parameter: controls weak-compressibility (Mach) and viscosity via τ and ν=(τ-1/2)/3.
+# LBM reference/stability parameter: controls weak-compressibility (Mach) and viscosity via Ï„ and Î½=(Ï„-1/2)/3.
 rho0 = 1.0             # lattice reference density (arbitrary in incompressible flow, usually 1.0)
 
 # Lattice Velocity Scaling
@@ -342,11 +420,11 @@ rho0 = 1.0             # lattice reference density (arbitrary in incompressible 
 # the velocity in lattice units (dx/dt) must be small compared to the 
 # lattice speed of sound (cs = 1/sqrt(3) approx 0.577).
 # u_lid < 0.1 ensures Mach number < 0.17, keeping compressibility errors low (<3%).
-# LBM reference/stability parameter: controls weak-compressibility (Mach) and viscosity via τ and ν=(τ-1/2)/3.
+# LBM reference/stability parameter: controls weak-compressibility (Mach) and viscosity via Ï„ and Î½=(Ï„-1/2)/3.
 u_lid = 0.075 # use a relatively small value as with very high Reynolds numbers, flow can have strong velocity amplifications   
 
 # -----------------------------------------------------------------------------
-# Physical ↔ lattice-unit mapping
+# Physical â†” lattice-unit mapping
 # LBM evolves in nondimensional lattice units. We keep a small reference lattice
 # speed (u_lid) for low-Mach stability, then scale to physical velocities with:
 #   vel_scale = U_ref_phys / u_lid   [m/s per lattice unit]
@@ -486,6 +564,7 @@ w_wave = ti.field(dtype=ti.f32, shape=(Ny, Nx)) # z-dir velocity along wave surf
 
 water_h = ti.field(dtype=ti.f32, shape=(Ny, Nx))  # instantaneous water surface height (meters)
 water_h_last = ti.field(dtype=ti.f32, shape=(Ny, Nx)) # previous water surface height (meters)
+piecewise_bed_z = ti.field(dtype=ti.f32, shape=Nx) # stationary piecewise-linear bed elevation sampled at x cell centers
 phi = ti.field(dtype=ti.f32, shape=(Nz, Ny, Nx)) # signed distance (positive = air)
 free_surface_h = ti.field(dtype=ti.f32, shape=(Ny, Nx))  # physical water free-surface elevation [m]
 free_surface_h_last = ti.field(dtype=ti.f32, shape=(Ny, Nx)) # previous free-surface elevation [m]
@@ -507,7 +586,7 @@ vof_exterior_gas = ti.field(dtype=ti.i32, shape=(Nz, Ny, Nx)) # gas cells connec
 f = ti.Vector.field(19, dtype=ti.f32, shape=(Nz, Ny, Nx))  # main distribution functions
 f_new = ti.Vector.field(19, dtype=ti.f32, shape=(Nz, Ny, Nx))  # post-collision distribution functions
 lattice_open = ti.Vector.field(19, dtype=ti.i32, shape=(Nz, Ny, Nx))  # boolean mark for open-channel cells (1=open,0=solid)
-lattice_open_frac = ti.Vector.field(19, dtype=ti.f32, shape=(Nz, Ny, Nx))  # δ for each q (only meaningful when blocked)
+lattice_open_frac = ti.Vector.field(19, dtype=ti.f32, shape=(Nz, Ny, Nx))  # Î´ for each q (only meaningful when blocked)
 
 lattice_wall_type = ti.Vector.field(19, dtype=ti.i32, shape=(Nz, Ny, Nx))  # nearest wall source per link
 
@@ -554,13 +633,13 @@ def calculate_feq(k_rho, k_ux, k_uy, k_uz, q):
     #
     # Notes:
     # - This is the standard second-order Hermite expansion:
-    #     feq = w*rho*(1 + 3(c·u) + 4.5(c·u)^2 - 1.5|u|^2)
+    #     feq = w*rho*(1 + 3(cÂ·u) + 4.5(cÂ·u)^2 - 1.5|u|^2)
     # - Keeping u_lid small ensures compressibility errors remain bounded.
     # -----------------------------------------------------------------------------
     # D3Q19 isothermal equilibrium
-    # feq_q = w_q * rho * [1 + 3(c·u) + 4.5(c·u)^2 - 1.5|u|^2]
+    # feq_q = w_q * rho * [1 + 3(cÂ·u) + 4.5(cÂ·u)^2 - 1.5|u|^2]
     k_u2 = k_ux * k_ux + k_uy * k_uy + k_uz * k_uz  # |u|^2
-    k_cu = 3.0 * (cx[q] * k_ux + cy[q] * k_uy + cz[q] * k_uz) # 3(c·u)
+    k_cu = 3.0 * (cx[q] * k_ux + cy[q] * k_uy + cz[q] * k_uz) # 3(cÂ·u)
     return k_rho * w[q] * (1.0 + k_cu + 0.5 * k_cu * k_cu - 1.5 * k_u2)
 
 
@@ -787,6 +866,34 @@ def free_surface_pressure_density_at_link(k: ti.i32, j: ti.i32, i: ti.i32, q: ti
         rho_fs = free_surface_hydrostatic_density_at_cell(k, j, i)
     return rho_fs
 
+
+@ti.func
+def vof_cell_liquid_fraction(k: ti.i32, j: ti.i32, i: ti.i32) -> ti.f32:
+    alpha = 1.0
+    if ti.static(water_free_surface_enabled == 1 and free_surface_tracking_mode == "vof"):
+        if lattice_open[k, j, i][0] == 1:
+            if free_surface_type[k, j, i] == FS_GAS:
+                alpha = 0.0
+            elif free_surface_type[k, j, i] == FS_INTERFACE:
+                alpha = free_surface_fill[k, j, i]
+                if alpha < 0.0:
+                    alpha = 0.0
+                if alpha > 1.0:
+                    alpha = 1.0
+    return alpha
+
+@ti.func
+def vof_link_liquid_aperture(
+    src_k: ti.i32,
+    src_j: ti.i32,
+    src_i: ti.i32,
+) -> ti.f32:
+    # Source-cell aperture for pull streaming. This is a VOF gas/liquid
+    # aperture only; closed solid cells are not gas and must be handled by the
+    # solid cut-link open fraction in stream().
+    return vof_cell_liquid_fraction(src_k, src_j, src_i)
+
+
 @ti.func
 def cube_sdf_at_point(xp: ti.f32, yp: ti.f32, zp: ti.f32) -> ti.f32:
     Lx = ti.cast(Nx, ti.f32) * dx
@@ -933,15 +1040,18 @@ def init_constants():
         f[k, j, i] = ti.Vector.zero(ti.f32, 19) # initialize to zero; will be set to equilibrium later
         f_new[k, j, i] = ti.Vector.zero(ti.f32, 19)  # Initialize vector accumulator (all zeros)
         lattice_wall_type[k, j, i] = ti.Vector.zero(ti.i32, 19)
-        # Local relaxation rate ω=1/τ: encodes ν_eff=ν0+ν_t so collision adapts to resolved shear (LES).
+        # Local relaxation rate Ï‰=1/Ï„: encodes Î½_eff=Î½0+Î½_t so collision adapts to resolved shear (LES).
         omegaLoc[k, j, i] = 1.0 / tau0
 
     for j, i in u_wave:  # Parallel loop over index space (Taichi SPMD)
         u_wave[j, i] = 0.0  # Intermediate scalar 'u_wave' for this kernel block
         v_wave[j, i] = 0.0  # Intermediate scalar 'v_wave' for this kernel block
         w_wave[j, i] = 0.0  # Intermediate scalar 'w_wave' for this kernel block
-        water_h[j, i] = offset_m  # Intermediate scalar 'water_h' for this kernel block
-        water_h_last[j, i] = offset_m  # Intermediate scalar 'water_h_last' for this kernel block
+        bed_h0 = offset_m
+        if ti.static(bed_profile == "piecewise_linear"):
+            bed_h0 = piecewise_bed_z[i]
+        water_h[j, i] = bed_h0  # Intermediate scalar 'water_h' for this kernel block
+        water_h_last[j, i] = bed_h0  # Intermediate scalar 'water_h_last' for this kernel block
         free_surface_h[j, i] = free_surface_base_m
         free_surface_h_last[j, i] = free_surface_base_m
         free_surface_flux_x[j, i] = 0.0
@@ -972,7 +1082,7 @@ def init_constants():
 @ti.kernel
 def update_wave_bed_and_velocities(t: ti.f32):
     # -----------------------------------------------------------------------------
-    # Prescribed moving “water surface” geometry and kinematics
+    # Prescribed moving â€œwater surfaceâ€ geometry and kinematics
     # When coupling with the wave model, this routine would be replaced
     # by a call to the wave solver to get the instantaneous surface height
     # and horizontal velocities at time t.
@@ -1028,27 +1138,23 @@ def update_wave_bed_and_velocities(t: ti.f32):
 
             # Update the prescribed surface height
             bed_h = offset_m + eta  # Prescribed bed/interface height (m) including vertical offset
+            if ti.static(bed_profile == "piecewise_linear"):
+                bed_h = piecewise_bed_z[i]
             water_h[j, i] = bed_h  # Intermediate scalar 'water_h' for this kernel block
 
-            # Surface slopes (analytic, consistent with eta)
-            eta_x1 = bed_amp_now * 0.5*k * ti.cos(phase)  # Intermediate scalar 'eta_x1' for this kernel block
-            eta_x2 = bed_amp_now * k * ti.cos(phase2)  # Intermediate scalar 'eta_x2' for this kernel block
-            eta_x = eta_x1 + eta_x2  # Interface slope ∂η/∂x (dimensionless)
-            eta_y = 0.0  # Interface slope ∂η/∂y (dimensionless)
-
-            # Time derivative of eta at fixed x (analytic):
-            eta_t = (water_h[j,i] - water_h_last[j,i]) / dt_phys  # m/s
-
-            # --- Choose the SURFACE (water-particle) horizontal velocity model ---
-            # These can eventually be adjusted to model some type of air-water slip
-            h0 = depth_swl_m  # Intermediate scalar 'h0' for this kernel block
-            u_s = c * eta1 / (h0 + eta1) + 0.5 * c * eta2 / (h0 + eta2)   # m/s
-            v_s = 0.0  # Prescribed surface spanwise velocity v(x,t) (m/s)
-
-            # --- Enforce kinematic BC to get the vertical component ---
-            # This is important! The IBB moving wall condition needs a consistent
-            # set of (u_s, v_s, w_s) that satisfy the kinematic BC.
-            w_s = eta_t + u_s * eta_x + v_s * eta_y  # m/s
+            # Moving beds impose wall velocity; stationary piecewise/flat beds do not.
+            u_s = 0.0
+            v_s = 0.0
+            w_s = 0.0
+            if ti.static(bed_is_moving == 1):
+                eta_x1 = bed_amp_now * 0.5*k * ti.cos(phase)
+                eta_x2 = bed_amp_now * k * ti.cos(phase2)
+                eta_x = eta_x1 + eta_x2
+                eta_y = 0.0
+                eta_t = (water_h[j,i] - water_h_last[j,i]) / dt_phys
+                h0 = depth_swl_m
+                u_s = c * eta1 / (h0 + eta1) + 0.5 * c * eta2 / (h0 + eta2)
+                w_s = eta_t + u_s * eta_x + v_s * eta_y
 
             # Store boundary velocities in LBM units
             u_wave[j, i] = u_s / vel_scale  # Intermediate scalar 'u_wave' for this kernel block
@@ -2045,7 +2151,12 @@ def update_free_surface_height_from_vof():
             column_depth = 0.0
             for k in range(Nz):
                 if lattice_open[k, j, i][0] == 1:
-                    column_depth += free_surface_fill[k, j, i] * dx
+                    # Convert VOF fill to a column height using the same
+                    # sub-cell solid geometry used by the immersed boundary.
+                    # Without this, sloping-bed cut cells are counted as full
+                    # cells and a flat still-water pool is reconstructed as a
+                    # stair-stepped free surface.
+                    column_depth += free_surface_fill[k, j, i] * lattice_open_frac[k, j, i][0] * dx
             free_surface_h_last[j, i] = h_old
             free_surface_h[j, i] = water_h[j, i] + column_depth
 
@@ -2176,6 +2287,9 @@ def refill_new_free_surface_cells():
                     if rho_from_pop > 1.0e-8:
                         scale = rho_refill / rho_from_pop
                     rho_from_pop = 0.0
+                    mx_from_pop = 0.0
+                    my_from_pop = 0.0
+                    mz_from_pop = 0.0
                     for q in ti.static(range(19)):
                         f_val = f_refill_vec[q] * scale
                         f[k, j, i][q] = f_val
@@ -2320,7 +2434,7 @@ def compute_phi_slope_corrected():
     # -----------------------------------------------------------------------------
     # Signed-distance (level-set-like) field construction for the immersed boundary
     #
-    # phi(k,j,i) is positive in air and negative inside the “water/solid” region.
+    # phi(k,j,i) is positive in air and negative inside the â€œwater/solidâ€ region.
     # A slope correction converts vertical distance to approximate distance along
     # the local surface normal, improving interpolation when the interface is
     # inclined relative to the grid.
@@ -2342,19 +2456,19 @@ def compute_phi_slope_corrected():
 
         # central differences of surface height h(x,y)
         # h = offset + eta, so dh/dx == deta/dx
-        dh_dx = (water_h[j, ip] - water_h[j, im]) * (0.5 / dx)  # Central-difference ∂h/∂x slope of prescribed interface
+        dh_dx = (water_h[j, ip] - water_h[j, im]) * (0.5 / dx)  # Central-difference âˆ‚h/âˆ‚x slope of prescribed interface
         if ti.static(x_boundary_mode == "solid"):
             if i == 0:
                 dh_dx = (water_h[j, i + 1] - water_h[j, i]) / dx
             elif i == Nx - 1:
                 dh_dx = (water_h[j, i] - water_h[j, i - 1]) / dx
-        dh_dy = (water_h[jp, i] - water_h[jm, i]) * (0.5 / dx)  # Central-difference ∂h/∂y slope of prescribed interface
+        dh_dy = (water_h[jp, i] - water_h[jm, i]) * (0.5 / dx)  # Central-difference âˆ‚h/âˆ‚y slope of prescribed interface
         # 2D normal-distance denominator
-        denom = ti.sqrt(1.0 + dh_dx * dh_dx + dh_dy * dh_dy)  # Normalization sqrt(1+|∇h|^2) for slope-corrected normal distance
+        denom = ti.sqrt(1.0 + dh_dx * dh_dx + dh_dy * dh_dy)  # Normalization sqrt(1+|âˆ‡h|^2) for slope-corrected normal distance
 
         # avoid pathological tiny denom (shouldn't happen, but safe)
         if denom < 1e-6:  # Guard against degenerate slope norm (avoid divide-by-zero)
-            denom = 1.0  # Normalization sqrt(1+|∇h|^2) for slope-corrected normal distance
+            denom = 1.0  # Normalization sqrt(1+|âˆ‡h|^2) for slope-corrected normal distance
 
         # signed distance along the local normal
         h_loc = water_h[j, i]  # Local prescribed interface height h(x,y,t) (m)
@@ -2378,25 +2492,25 @@ def compute_phi_slope_corrected():
 @ti.kernel
 def build_lattice_open_from_free_surface_periodic():
     # -----------------------------------------------------------------------------
-    # Build per-direction open/blocked flags and open fractions from the free surface η(x,y,t),
+    # Build per-direction open/blocked flags and open fractions from the free surface Î·(x,y,t),
     # using periodic bilinear sampling of the height field water_h(y,x).
     #
     # For each cell center (xc,yc,zc) and each D3Q19 direction q:
     # 1) Evaluate the link half-step endpoint:
     #       (xq,yq,zq) = (xc,yc,zc) + 0.5*dx*(cx[q],cy[q],cz[q])
-    # 2) Wrap (xq,yq) periodically into [0,Lx)×[0,Ly), convert to continuous indices (u,v),
-    #    and bilinearly interpolate η = water_h at (xq,yq).
+    # 2) Wrap (xq,yq) periodically into [0,Lx)Ã—[0,Ly), convert to continuous indices (u,v),
+    #    and bilinearly interpolate Î· = water_h at (xq,yq).
     # 3) Form continuous openness from the vertical gap:
-    #       gap = zq - η
+    #       gap = zq - Î·
     #       frac = clamp(0.5 + gap/dx, 0, 1)    -> lattice_open_frac[...,q]
-    # 4) Form a binary open flag (your “Option B” hard test):
-    #       lo[q] = 1 if (η <= zq) else 0       -> lattice_open[...,q]
+    # 4) Form a binary open flag (your â€œOption Bâ€ hard test):
+    #       lo[q] = 1 if (Î· <= zq) else 0       -> lattice_open[...,q]
     #
     # Diagnostics / cell-wise indicators:
     # - lf[0] stores the same frac mapping at the cell center (q=0 diagnostic).
     # - lo[0] is set to 1 if any lo[q]==1 (cell has at least one open link); else 0.
     # - near_obstacle[k,j,i] = 1 if any lo[q]==0 (cell touches the interface/blocked link).
-    # - If lo[0]==0, optionally force lf[q]=0 for all q to prevent porous “solid” cells.
+    # - If lo[0]==0, optionally force lf[q]=0 for all q to prevent porous â€œsolidâ€ cells.
     #
     # Outputs: lattice_open, lattice_open_frac, near_obstacle.
     # -----------------------------------------------------------------------------
@@ -2449,7 +2563,7 @@ def build_lattice_open_from_free_surface_periodic():
         hx1 = h01 * (1.0 - fx) + h11 * fx  # Intermediate scalar 'hx1' for this kernel block
         eta_c = hx0 * (1.0 - fy) + hx1 * fy  # Intermediate scalar 'eta_c' for this kernel block
 
-        gap_c = zc - eta_c  # Vertical gap between cell center z_c and interface η(x_c,y_c,t) (m)
+        gap_c = zc - eta_c  # Vertical gap between cell center z_c and interface Î·(x_c,y_c,t) (m)
         geometry_gap_c = 1.0e6
         wall_type_c = WALL_NONE
         if ti.static(include_bed_geometry == 1):
@@ -2499,7 +2613,7 @@ def build_lattice_open_from_free_surface_periodic():
             fx = u - ti.cast(i0, ti.f32)  # Type cast for Taichi kernel arithmetic / indexing
             fy = v - ti.cast(j0, ti.f32)  # Type cast for Taichi kernel arithmetic / indexing
 
-            # --- bilinear interpolation of η ---
+            # --- bilinear interpolation of Î· ---
             h00 = water_h[j0, i0]  # Intermediate scalar 'h00' for this kernel block
             h10 = water_h[j0, i1]  # Intermediate scalar 'h10' for this kernel block
             h01 = water_h[j1, i0]  # Intermediate scalar 'h01' for this kernel block
@@ -2507,10 +2621,10 @@ def build_lattice_open_from_free_surface_periodic():
 
             hx0 = h00 * (1.0 - fx) + h10 * fx  # Intermediate scalar 'hx0' for this kernel block
             hx1 = h01 * (1.0 - fx) + h11 * fx  # Intermediate scalar 'hx1' for this kernel block
-            eta = hx0 * (1.0 - fy) + hx1 * fy  # Interface elevation perturbation η(x,y,t) (m)
+            eta = hx0 * (1.0 - fy) + hx1 * fy  # Interface elevation perturbation Î·(x,y,t) (m)
 
             # --- open fraction from endpoint gap (continuous) ---
-            gap = zq - eta  # Vertical gap between link endpoint z_q and interface η(x_q,y_q,t) (m)
+            gap = zq - eta  # Vertical gap between link endpoint z_q and interface Î·(x_q,y_q,t) (m)
             geometry_gap = 1.0e6
             wall_type_q = WALL_NONE
             if ti.static(include_bed_geometry == 1):
@@ -2832,8 +2946,8 @@ def macro_step(step: ti.i32):
     # Macroscopic update: compute rho and u from current populations f
     #
     # LBM moment relations:
-    #   rho = Σ_q f_q
-    #   j   = Σ_q f_q * c_q   (momentum density)
+    #   rho = Î£_q f_q
+    #   j   = Î£_q f_q * c_q   (momentum density)
     #   u   = j / rho
     #
     # Boundary enforcement at the macro level:
@@ -2858,9 +2972,9 @@ def macro_step(step: ti.i32):
     # velocity
     for k, j, i in ux:  # Parallel sweep over field indices (SPMD; Taichi schedules)
         # x,y,z-momentum: contributions from all x-directed lattice velocities
-        jx = 0.0  # Momentum density component Σ f_q c_{qx}
-        jy = 0.0  # Momentum density component Σ f_q c_{qy}
-        jz = 0.0  # Momentum density component Σ f_q c_{qz}
+        jx = 0.0  # Momentum density component Î£ f_q c_{qx}
+        jy = 0.0  # Momentum density component Î£ f_q c_{qy}
+        jz = 0.0  # Momentum density component Î£ f_q c_{qz}
         for q in ti.static(range(19)):  # Unrolled loop over lattice directions q (compile-time static)
             fval = f[k, j, i][q]  # Population value f_q at this cell (used for momentum sums)
             jx += fval * cx[q]
@@ -2958,7 +3072,7 @@ def compute_LES():
             dw_dy = 0.5 * (uz[k, jp, i] - uz[k, jm, i])  # Intermediate scalar 'dw_dy' for this kernel block
             dw_dz = 0.5 * (uz[kp, j, i] - uz[km, j, i])  # Intermediate scalar 'dw_dz' for this kernel block
 
-            # Strain-rate tensor components S_ij = 0.5(∂u_i/∂x_j + ∂u_j/∂x_i)
+            # Strain-rate tensor components S_ij = 0.5(âˆ‚u_i/âˆ‚x_j + âˆ‚u_j/âˆ‚x_i)
             Sxx = du_dx  # Intermediate scalar 'Sxx' for this kernel block
             Syy = dv_dy  # Intermediate scalar 'Syy' for this kernel block
             Szz = dw_dz  # Intermediate scalar 'Szz' for this kernel block
@@ -3023,7 +3137,7 @@ def compute_LES():
 
             nu_t_field[k, j, i] = nu_t  # Diagnostic field for post-processing / visualization
             Smag_stress_field[k, j, i] = S_mag  # Diagnostic field for post-processing / visualization
-            # Local relaxation rate ω=1/τ: encodes ν_eff=ν0+ν_t so collision adapts to resolved shear (LES).
+            # Local relaxation rate Ï‰=1/Ï„: encodes Î½_eff=Î½0+Î½_t so collision adapts to resolved shear (LES).
             omegaLoc[k, j, i] = 1.0 / tau_eff
 
 @ti.kernel
@@ -3034,7 +3148,7 @@ def collide_KBC():
     # Steps per cell:
     # 1) Build equilibrium populations feq from local (rho,u).
     # 2) Compute standard BGK post-collision f_star = f - omega*(f - feq).
-    # 3) Apply an “entropic-like” limiter (alpha in [0,1]) to prevent negative f:
+    # 3) Apply an â€œentropic-likeâ€ limiter (alpha in [0,1]) to prevent negative f:
     #       f_post = feq + alpha*(f_star - feq)
     #    This is a pragmatic positivity safeguard in high-Re, coarse-grid LES.
     # 4) Optional backscatter (currently gated by C_backscatter):
@@ -3079,7 +3193,7 @@ def collide_KBC():
         if is_sponge:  # Branch for boundary/stability logic
             # strong relaxation toward equilibrium to damp perturbations
             for q in ti.static(range(19)):  # Unrolled loop over lattice directions q (compile-time static)
-                cu = 3.0 * (cx[q] * ux_loc + cy[q] * uy_loc + cz[q] * uz_loc)  # Scaled dot product 3(c_q·u) for equilibrium evaluation
+                cu = 3.0 * (cx[q] * ux_loc + cy[q] * uy_loc + cz[q] * uz_loc)  # Scaled dot product 3(c_qÂ·u) for equilibrium evaluation
                 feq_q = rho_loc * w[q] * (1.0 + cu + 0.5 * cu * cu - 1.5 * u2)  # Intermediate scalar 'feq_q' for this kernel block
                 f_val = f[k, j, i][q]  # Intermediate scalar 'f_val' for this kernel block
                 f[k, j, i][q] = f_val - om_sponge_left * (f_val - feq_q)
@@ -3091,7 +3205,7 @@ def collide_KBC():
             # --- build feq
             feq = ti.Vector.zero(ti.f32, 19)  # Initialize vector accumulator (all zeros)
             for q in ti.static(range(19)):  # Unrolled loop over lattice directions q (compile-time static)
-                cu = 3.0 * (cx[q] * ux_loc + cy[q] * uy_loc + cz[q] * uz_loc)  # Scaled dot product 3(c_q·u) for equilibrium evaluation
+                cu = 3.0 * (cx[q] * ux_loc + cy[q] * uy_loc + cz[q] * uz_loc)  # Scaled dot product 3(c_qÂ·u) for equilibrium evaluation
                 feq[q] = rho_loc * w[q] * (1.0 + cu + 0.5 * cu * cu - 1.5 * u2)  # Intermediate scalar 'feq' for this kernel block
 
             # --- BGK/KBC-style relaxation
@@ -3117,7 +3231,7 @@ def collide_KBC():
             alpha = 1.0  # Intermediate scalar 'alpha' for this kernel block
             for q in ti.static(range(19)):  # Unrolled loop over lattice directions q (compile-time static)
                 if f_star[q] < eps:  # Branch for boundary/stability logic
-                    denom = f_star[q] - feq[q]  # Normalization sqrt(1+|∇h|^2) for slope-corrected normal distance
+                    denom = f_star[q] - feq[q]  # Normalization sqrt(1+|âˆ‡h|^2) for slope-corrected normal distance
                     if denom < 0.0:  # Guard against degenerate slope norm (avoid divide-by-zero)
                         candidate = (eps - feq[q]) / denom  # Intermediate scalar 'candidate' for this kernel block
                         if candidate < alpha:  # Branch for boundary/stability logic
@@ -3358,7 +3472,24 @@ def stream():
                     ti.atomic_add(boundary_cut_link_count[None], 1)
                 elif 0 <= src_k < Nz and not src_is_real_gas:
                     frac = lattice_open_frac[k, j, i][q]  # Open-link fraction for solid geometry only
-                    f_new[k, j, i][q] = frac * f[src_k, src_j, src_i][q] + (1.0 - frac) * f[k, j, i][opp[q]]
+                    f_stream = frac * f[src_k, src_j, src_i][q] + (1.0 - frac) * f[k, j, i][opp[q]]
+                    f_out = f_stream
+                    if ti.static(free_surface_tracking_mode == "vof" and vof_link_aperture_enabled == 1):
+                        link_alpha = vof_link_liquid_aperture(src_k, src_j, src_i)
+                        if link_alpha < 1.0:
+                            qbar = opp[q]
+                            rho_fs = rho0
+                            ux_fs = ux[k, j, i]
+                            uy_fs = uy[k, j, i]
+                            uz_fs = uz[k, j, i]
+                            if ti.static(use_hydrostatic_balanced_pressure == 1 or free_surface_boundary_mode == "hydrostatic"):
+                                rho_fs = free_surface_pressure_density_at_link(k, j, i, q)
+                            f_eq_q = calculate_feq(rho_fs, ux_fs, uy_fs, uz_fs, q)
+                            f_eq_bar = calculate_feq(rho_fs, ux_fs, uy_fs, uz_fs, qbar)
+                            f_fs = f_eq_q + f_eq_bar - f[k, j, i][qbar]
+                            f_out = link_alpha * f_stream + (1.0 - link_alpha) * f_fs
+                            ti.atomic_add(free_surface_cut_link_count[None], 1)
+                    f_new[k, j, i][q] = f_out
                     if frac < 1.0:
                         ti.atomic_add(boundary_cut_link_count[None], 1)
                 elif src_k < 0:
@@ -3451,7 +3582,7 @@ def apply_x_solid_wall_bounceback():
 @ti.kernel
 def apply_open_boundary_conditions():
     # ============================================================
-    # Apply “open” / driving boundary conditions after streaming by
+    # Apply â€œopenâ€ / driving boundary conditions after streaming by
     # selectively relaxing f_new toward target equilibria.
     #
     # (A) X-FRINGE / HYBRID INLET FORCING (periodic-x domains)
@@ -3463,7 +3594,7 @@ def apply_open_boundary_conditions():
     #     sigma = inlet_strength * smoothstep01(s), not a hard overwrite.
     #
     # (B) TOP BOUNDARY (k = Nz-1)
-    #     Impose a simple “open/drive” condition by setting populations
+    #     Impose a simple â€œopen/driveâ€ condition by setting populations
     #     to equilibrium corresponding to (rho0, u_top_lb, 0, 0) on open
     #     cells. (As written, this overwrites all q; a less dissipative
     #     variant would reconstruct only incoming populations.)
@@ -3473,7 +3604,7 @@ def apply_open_boundary_conditions():
     #     bounce-back / IBB-style correction blended by lattice_open_frac:
     #       f_new(q) <- frac_open * f_new(q) + (1-frac_open) * f_wall
     #     where f_wall is the reflected opposite population with a standard
-    #     momentum correction proportional to (c_q̄ · u_wall). This enforces
+    #     momentum correction proportional to (c_qÌ„ Â· u_wall). This enforces
     #     no-slip wall motion smoothly on partially blocked links.
     # ============================================================
 
@@ -3486,8 +3617,8 @@ def apply_open_boundary_conditions():
     #     and continuously re-injects momentum/turbulence so the
     #     domain does not spin down under bottom drag.
     # ============================================================
-    inlet_width = 5        # tune 12–24
-    inlet_strength = 0.01   # tune 0.10–0.40 (too large -> over-constraint)
+    inlet_width = 5        # tune 12â€“24
+    inlet_strength = 0.01   # tune 0.10â€“0.40 (too large -> over-constraint)
 
     # Guard for inlet_width=1 to avoid division by zero
     denom_i = ti.cast(inlet_width - 1, ti.f32)  # Type cast for Taichi kernel arithmetic / indexing
@@ -3534,9 +3665,9 @@ def apply_open_boundary_conditions():
     # ============================================================
     # (C) BOTTOM BED IBB (moving-wall bounce-back with open-fraction blending)
     #     For near_obstacle cells, build a moving-wall reflected population using
-    #     the opposite direction q̄ and wall velocity (u_wave,v_wave,w_wave), then
+    #     the opposite direction qÌ„ and wall velocity (u_wave,v_wave,w_wave), then
     #     blend it with the streamed value using lattice_open_frac:
-    #         f_wall = f_pre[q̄] - 6*w[q̄]*rho0*(c_q̄ · u_wall)
+    #         f_wall = f_pre[qÌ„] - 6*w[qÌ„]*rho0*(c_qÌ„ Â· u_wall)
     #         f_new[q] = frac_open*f_new[q] + (1-frac_open)*f_wall
     #     so frac_open=1 is fully open, frac_open=0 fully enforces the wall.
     # ============================================================
@@ -3550,7 +3681,7 @@ def apply_open_boundary_conditions():
             u_wz = w_wave[j, i]  # Intermediate scalar 'u_wz' for this kernel block
 
             for q in ti.static(range(1, 19)):  # Unrolled loop over lattice directions q (compile-time static)
-                qbar = opp[q]  # Opposite lattice direction index q̄
+                qbar = opp[q]  # Opposite lattice direction index qÌ„
 
                 frac_open = lattice_open_frac[k, j, i][q]   # Open fraction for this link used to blend stream vs. bounce-back
 
@@ -3572,7 +3703,7 @@ def apply_open_boundary_conditions():
                         u_wy = u_wall_q[1]
                         u_wz = u_wall_q[2]
 
-                cuw = (ti.cast(cx[qbar], ti.f32) * u_wx +  # Dot product (c_q̄ · u_wall) for moving-wall momentum correction
+                cuw = (ti.cast(cx[qbar], ti.f32) * u_wx +  # Dot product (c_qÌ„ Â· u_wall) for moving-wall momentum correction
                        ti.cast(cy[qbar], ti.f32) * u_wy +
                        ti.cast(cz[qbar], ti.f32) * u_wz)
 
@@ -3643,6 +3774,7 @@ def main():
     # -----------------------------------------------------------------------------
     direct_metrics_file = configure_direct_visualization()
 
+    piecewise_bed_z.from_numpy(piecewise_bed_z_np)
     init_constants()  # set physical/lattice scales, solver parameters, and constants
     update_wave_bed_and_velocities(0.0)  # initialize moving bed geometry + wall velocity at t=0
     compute_phi_slope_corrected()  # build signed-distance-like phi for interface/wall model
@@ -3689,6 +3821,7 @@ def main():
                 f"detached_max_wet_neighbors={vof_detached_max_wet_neighbors}, "
                 f"detached_max_resolved_neighbors={vof_detached_max_resolved_neighbors}, "
                 f"detached_residual_fill_threshold={vof_detached_residual_fill_threshold:.4f}, "
+                f"link_aperture={vof_link_aperture_enabled == 1}, "
                 f"thin_gap_bridge={vof_thin_gap_bridge_enabled}, "
                 f"bridge_strength={vof_thin_gap_bridge_strength:.3f}, "
                 f"collapse_trapped_gas={vof_collapse_trapped_gas_enabled}, "
@@ -3709,6 +3842,16 @@ def main():
                 f"sigma={gaussian_sigma_m:.3f} m, zero initial velocity"
             )
     print(f"Bed profile: {bed_profile}, bed_level={offset_m:.3f} m")
+    if bed_profile == "piecewise_linear":
+        print(
+            f"Piecewise bottom: file={piecewise_bed_metadata['path']}, "
+            f"points={piecewise_bed_metadata['point_count']}, "
+            f"x_first={piecewise_bed_metadata['first_x']:.3f} m, "
+            f"x_last={piecewise_bed_metadata['last_x']:.3f} m, "
+            f"z_min={piecewise_bed_metadata['min_z']:.3f} m, "
+            f"z_max={piecewise_bed_metadata['max_z']:.3f} m, "
+            f"z_at_Lx={piecewise_bed_metadata['z_at_lx']:.3f} m"
+        )
     print(f"Obstacle mode: {obstacle_mode}")
     if include_cube_geometry == 1:
         print(

@@ -1701,3 +1701,129 @@ fluid-solid interfaces are not drawn as false water-air surfaces. Solid objects
 are rendered separately and opaquely. Mesh smoothing and interpolation are
 visualization-only and do not modify VOF fill, mass, velocity, density, pressure,
 or any solver field.
+
+### VOF Source-Aperture Link Flux
+
+Date: 2026-06-23
+
+The first VOF link-aperture implementation treated every wet-to-wet partial-fill
+link as partially atmospheric using `min(fill_dst, fill_src)`. That is too broad
+for quiet free-surface regions because tangential links along a locally flat
+interface are already handled by the conservative VOF mass exchange. Applying a
+gas-side reconstruction there can duplicate the free-surface condition.
+
+The current implementation uses a source-cell VOF aperture. In the
+pull-streaming step, the incoming wet-to-wet population is weighted by the
+liquid volume fraction of the upstream/source cell. The remaining part of the
+link is treated with the existing atmospheric free-surface reconstruction. This
+directly prevents a partially filled neighbor from supplying a full liquid
+population along a link. It is a cell-averaged flux interpretation, not a change
+to viscosity, forcing, relaxation time, or density.
+
+Flat-water result through 500 steps on the diagnostic domain:
+
+```text
+height high-pass RMS: 0.0 m
+height high-pass max: 0.0 m
+surface pressure high-pass RMS: ~0.72 Pa
+near-surface vorticity max: ~1e-6 lattice/cell
+```
+
+For a `5 m` solitary-wave initial condition measured in the downstream window
+`x=120..155 m`, source-cell aperture strongly reduced the high-wavenumber
+downstream response by step 500:
+
+```text
+broad aperture:      h_HP_RMS ~2.02e-2 m, p_HP_RMS ~7.12e2 Pa
+directional aperture: h_HP_RMS ~1.77e-2 m, p_HP_RMS ~4.86e2 Pa
+source aperture:      h_HP_RMS ~2.88e-4 m, p_HP_RMS ~4.84 Pa
+```
+
+The source-aperture result supports the diagnosis that the problem was a
+wet-to-wet link flux inconsistency: VOF mass transport was fraction-aware, while
+the corresponding incoming populations could still behave like full-cell
+populations in quiet, nearly flat interface regions.
+
+The high-pass comparison above contains some contribution from smooth
+solitary-wave curvature, but the order-of-magnitude reduction in pressure and
+surface roughness indicates that the source-aperture link flux fixed the
+low-gradient VOF population imbalance.
+
+#### Solid-Source Guard
+
+Date: 2026-06-24
+
+The source-cell VOF aperture must distinguish gas from solid. A sloping bed can
+place a closed solid cell upstream of an active fluid node along a cut link.
+Those closed solid cells have `free_surface_fill=0` because they are not fluid,
+but they are not atmospheric gas. Treating that zero fill as a VOF gas aperture
+caused the stream step to replace a solid-boundary cut link with the gas-side
+free-surface pressure reconstruction, launching a startup pressure and velocity
+pulse along the sloping bed.
+
+The aperture now returns full liquid aperture for closed solid source cells, so
+the existing solid cut-link open fraction and bounce-back path handles those
+links. Actual open gas/interface/liquid VOF cells keep the previous source-cell
+aperture behavior. This is a boundary classification correction, not added
+dissipation or smoothing.
+
+For the current `run_lbm_case.py` still-water sloping-bed setup
+(`LBM_FREE_SURFACE_INITIAL=solitary` with effectively zero amplitude), the first
+post-stream maximum speed near the steep bed dropped from about `0.62 m/s` to
+about `2.7e-5 m/s`. In the visible 100-step run, the boundary-band high-pass
+total-pressure diagnostic stayed below `1 Pa` and vorticity stayed near
+`1e-8` to `1e-7`.
+
+### Piecewise-Linear Solid Bed
+
+Date: 2026-06-24
+
+`LBM_BED_PROFILE=piecewise_linear` reads a stationary solid-bed profile from
+`LBM_BOTTOM_FILE`. The file is plain text with one `x_m z_m` pair per line;
+blank lines and `#` comments are allowed. Commas are also accepted as
+separators.
+
+Example:
+
+```text
+# x_m z_m
+0.0 0.0
+40.0 0.0
+80.0 2.0
+160.0 2.0
+```
+
+The points are sorted by `x`; duplicate `x` values are rejected. The sampled bed
+uses linear interpolation between supplied points. For `x` before the first
+point, the first `z` is held constant. If the last point is before `LBM_LX_M`,
+the last `z` is held constant to the end of the domain. If the file extends
+beyond `LBM_LX_M`, the bed at the domain end is obtained by interpolation on the
+segment crossing `LBM_LX_M`.
+
+This is only a bed-elevation source. It still pipes through
+`LBM_OBSTACLE_MODE=bed` or `bed_cube` and uses the existing `water_h`,
+`compute_phi_slope_corrected`, `build_lattice_open_from_free_surface_periodic`,
+`lattice_open_frac`, and wall-type boundary machinery. The piecewise bed is
+stationary, so the imposed wall velocity is zero.
+
+### Sloping-Bed VOF Column Reconstruction
+
+Date: 2026-06-24
+
+For VOF tracking over a sloping piecewise-linear bed, `free_surface_h` is a
+diagnostic column reconstruction, not the actual non-single-valued interface.
+The reconstruction now weights each VOF cell by the existing cell-center solid
+open fraction `lattice_open_frac[..., 0]`:
+
+```text
+column_depth += free_surface_fill * lattice_open_frac[...,0] * dx
+```
+
+This is a geometry cell-average. It does not change viscosity, pressure
+formulation, collision physics, free-surface fill/mass transport, or the solid
+boundary condition. The previous reconstruction counted every open-center
+bed-cut cell as a full `dx` of water; for a flat still pool over the current
+sloping `bottom.txt`, that converted an exactly flat initialized surface into a
+stair-stepped reconstructed `free_surface_h` with about 0.475 m max artificial
+error. The geometry-weighted reconstruction reduces that diagnostic
+reconstruction error to about 0.018 m at `dx=0.25 m`.

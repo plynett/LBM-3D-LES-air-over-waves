@@ -9,6 +9,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from lbm_env import taichi_cache_config
+
 
 METRIC_FIELDNAMES = [
     "label", "step", "time_phys", "max_speed_phys", "max_speed_x",
@@ -264,6 +266,8 @@ def load_solver(path: Path, label: str, random_seed: int | None):
 
         def init_with_seed(*args, **kwargs):
             kwargs.setdefault("random_seed", random_seed)
+            for key, value in taichi_cache_config().items():
+                kwargs.setdefault(key, value)
             return original_init(*args, **kwargs)
 
         ti.init = init_with_seed
@@ -734,7 +738,6 @@ def make_visualize(module, label: str, output_dir: Path, metrics_writer):
         ax1 = plt.subplot(3, 1, 1)
         im1 = ax1.pcolormesh(x_slice, z_slice, vort, shading="auto")
         ax1.plot(x_line, bed_line, color="black", linewidth=1.0)
-        ax1.plot(x_line, band_line, color="black", linewidth=0.8, linestyle="--")
         draw_free_surface(ax1)
         draw_cube_outline(ax1)
         plt.colorbar(im1, ax=ax1, label="Vorticity (LB)")
@@ -751,7 +754,6 @@ def make_visualize(module, label: str, output_dir: Path, metrics_writer):
         ax2 = plt.subplot(3, 1, 2)
         im2 = ax2.pcolormesh(x_slice, z_slice, speed_xz_phys, shading="auto")
         ax2.plot(x_line, bed_line, color="black", linewidth=1.0)
-        ax2.plot(x_line, band_line, color="black", linewidth=0.8, linestyle="--")
         draw_free_surface(ax2)
         draw_cube_outline(ax2)
         plt.colorbar(im2, ax=ax2, label="Speed (m/s)")
@@ -803,7 +805,6 @@ def make_visualize(module, label: str, output_dir: Path, metrics_writer):
                 )
         im3 = ax3.pcolormesh(x_slice, z_slice, pressure_plot, shading="auto")
         ax3.plot(x_line, bed_line, color="black", linewidth=1.0)
-        ax3.plot(x_line, band_line, color="black", linewidth=0.8, linestyle="--")
         draw_free_surface(ax3)
         draw_cube_outline(ax3)
         plt.colorbar(im3, ax=ax3, label=pressure_label)
